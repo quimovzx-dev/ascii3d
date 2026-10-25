@@ -13,6 +13,10 @@ Everything runs in the browser. Photos are never uploaded anywhere.
 
 Open `public/index.html` in a browser or deploy the `public` folder to any static host. No build step, no dependencies, no keys.
 
+## v2 (convenience/readability only)
+
+Adds Front/Side/Back/Top snap views, an XYZ axis gizmo, default colour for single photos, Save PNG and Save .txt, and a shadow-aware cutout. Shape accuracy is the same as v1: single-photo back/sides are still a guess, and multi-photo is tested on synthetic renders only.
+
 ## Known limits
 
 - Cutout works best on a plain or smoothly shaded background. Low-contrast subjects (white object on grey) may need the Cutout slider.

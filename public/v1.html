@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ASCII 3D - photo to rotatable ASCII model</title>
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+html,body{height:100%}body{margin:0;background:#0b0d10;color:#cfd6dd;font:14px/1.4 system-ui,sans-serif;display:flex;flex-direction:column;height:100vh;overflow:hidden}
+header{padding:12px 16px;border-bottom:1px solid #1f252c}
+h1{margin:0;font-size:18px;color:#7CFFB2;font-family:ui-monospace,monospace}
+header p{margin:4px 0 0;color:#8a95a0;font-size:12px}
+main{display:flex;flex:1;min-height:0}
+@media(max-width:760px){main{flex-direction:column-reverse}aside{width:100%!important;max-height:46vh;border-right:0!important;border-top:1px solid #1f252c}}
+aside{overflow:auto;width:320px;flex:none;max-width:100%;padding:14px;border-right:1px solid #1f252c;display:flex;flex-direction:column;gap:10px}
+#stage{flex:1;min-width:0;min-height:0;position:relative}
+canvas#view{width:100%;height:100%;touch-action:none;cursor:grab;position:absolute;inset:0}
+button,label.btn{background:#17202a;border:1px solid #2b3946;color:#dfe7ee;padding:8px 10px;border-radius:6px;cursor:pointer;font:inherit;text-align:center}
+button.primary{background:#14532d;border-color:#1f7a44}
+button:disabled{opacity:.5}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.row label{font-size:12px;color:#8a95a0}
+input[type=range]{flex:1;min-width:80px}
+#thumbs{display:flex;gap:6px;flex-wrap:wrap}
+#thumbs img{width:56px;height:56px;object-fit:cover;border-radius:4px;border:1px solid #2b3946}
+#status{font-size:12px;color:#9fb0bf;white-space:pre-wrap;min-height:2.6em}
+.note{font-size:12px;color:#8a95a0}
+.note b{color:#cfd6dd}
+#mode{padding:8px;background:#17202a;color:#dfe7ee;border:1px solid #2b3946;border-radius:6px}
+#hint{position:absolute;bottom:8px;left:0;right:0;text-align:center;font-size:12px;color:#5d6a76;pointer-events:none}
+</style></head><body>
+<header><h1>ASCII 3D</h1><p>Give it photos, get a 3D model drawn in ASCII. Drag to rotate. Everything runs in your browser; photos are never uploaded.</p></header>
+<main>
+<aside>
+<label class="btn">Choose photos<input id="file" type="file" accept="image/*" multiple hidden></label>
+<div id="thumbs"></div>
+<select id="mode">
+<option value="auto">Auto (1-2 photos = estimate, 3+ = reconstruct)</option>
+<option value="single">One photo: estimated 3D</option>
+<option value="multi">Several photos around an object: reconstruct</option>
+</select>
+<div class="row"><input type="checkbox" id="ai"><label for="ai" style="font-size:13px;color:#cfd6dd">Use AI depth for single photo (downloads ~25 MB model once, free)</label></div>
+<div class="row"><label>Detail</label><input id="res" type="range" min="40" max="120" value="96"></div>
+<div class="row"><label>Depth</label><input id="depth" type="range" min="20" max="140" value="70"></div>
+<div class="row"><label>Cutout</label><input id="thr" type="range" min="5" max="90" value="35"></div>
+<button class="primary" id="build" disabled>Build ASCII model</button>
+<div id="status">Pick a photo to start. A plain background works best.</div>
+<div class="row"><button id="spin">Auto-rotate: on</button><button id="col">Color: off</button><button id="inv">Invert shade</button></div>
+<div class="row"><button id="copy" disabled>Copy frame</button><button id="demo">Try demo shape</button></div>
+<div class="note"><b>Honest limits.</b> With <b>one photo</b> the back and sides are guessed (the shape is inflated from the outline and, optionally, AI depth, then mirrored). With <b>several photos</b> taken evenly around the object (turntable style, first photo = front, going around in one direction, same distance and height) it carves a real shape from the silhouettes. Hollows and concave parts cannot be recovered from silhouettes.</div>
+</aside>
+<div id="stage"><canvas id="view"></canvas><div id="hint">drag to rotate - scroll or pinch to zoom</div></div>
+</main>
+<script>
+"use strict";
+const $=id=>document.getElementById(id);
+const RAMP=" .:-=+*#%@";
+let spanOf=60;let images=[];       // HTMLImageElement
+let model=null;      // {pts:Float32Array(x,y,z,nx,ny,nz,lum,r,g,b), n}
+let rotY=0.6,rotX=-0.25,zoom=1,spin=true,color=false,invert=false,dragging=false,lastT=0;
+const cv=$('view'),ctx=cv.getContext('2d');
+
+function status(s){$('status').textContent=s}
+function loadImg(f){return new Promise((ok,no)=>{const i=new Image();i.onload=()=>ok(i);i.onerror=no;i.src=URL.createObjectURL(f)})}
+$('file').onchange=async e=>{
+  images=[];$('thumbs').innerHTML='';
+  const fs=[...e.target.files].slice(0,36);
+  for(const f of fs){try{const i=await loadImg(f);images.push(i);const t=i.cloneNode();$('thumbs').appendChild(t)}catch(_){}}
+  $('build').disabled=!images.length;
+  status(images.length?`${images.length} photo(s) loaded. Press Build.`:'Could not read those files.');
+};
+
+// ---------- image to mask + color grid ----------
+function toGrid(img,W,H){
+  // fit image into W x H keeping aspect, on a bg-colored canvas edge
+  const c=document.createElement('canvas');c.width=W;c.height=H;const x=c.getContext('2d',{willReadFrequently:true});
+  const s=Math.min(W/img.naturalWidth,H/img.naturalHeight);
+  const w=img.naturalWidth*s,h=img.naturalHeight*s;
+  x.fillStyle='#808080';x.fillRect(0,0,W,H);
+  x.drawImage(img,(W-w)/2,(H-h)/2,w,h);
+  const d=x.getImageData(0,0,W,H).data;
+  return {d,W,H,ox:(W-w)/2,oy:(H-h)/2,w,h};
+}
+function median(a){a.sort((p,q)=>p-q);return a[a.length>>1]}
+function makeMask(g,thrPct){
+  const {d,W,H}=g;const bx=[],by=[],bz=[];
+  const ins=(x,y)=>x>=g.ox-.5&&x<g.ox+g.w+.5&&y>=g.oy-.5&&y<g.oy+g.h+.5;
+  const edge=[];
+  for(let y=0;y<H;y++)for(let x=0;x<W;x++){
+    if(!ins(x,y))continue;
+    if(x<=g.ox+1||y<=g.oy+1||x>=g.ox+g.w-2||y>=g.oy+g.h-2){const k=(y*W+x)*4;bx.push(d[k]);by.push(d[k+1]);bz.push(d[k+2])}
+  }
+  const br=median(bx),bg=median(by),bb=median(bz);
+  const dist=new Float32Array(W*H);let mx=1;
+  // background model: interpolate between opposite borders (handles gradients/vignettes)
+  const x0=Math.max(0,Math.ceil(g.ox)),x1=Math.min(W-1,Math.floor(g.ox+g.w)-1),y0=Math.max(0,Math.ceil(g.oy)),y1=Math.min(H-1,Math.floor(g.oy+g.h)-1);
+  // least-squares quadratic fit of each channel over a 2px border ring
+  const feat=(x,y)=>{const u=(x-(x0+x1)/2)/Math.max(1,(x1-x0)/2),v=(y-(y0+y1)/2)/Math.max(1,(y1-y0)/2);return [1,u,v,u*u,u*v,v*v]};
+  const coef=[0,1,2].map(c=>{
+    const A=Array.from({length:6},()=>new Float64Array(7));
+    for(let y=y0;y<=y1;y++)for(let x=x0;x<=x1;x++){
+      if(!(x<x0+2||x>x1-2||y<y0+2||y>y1-2))continue;
+      const f=feat(x,y),val=d[(y*W+x)*4+c];
+      for(let r=0;r<6;r++){for(let q=0;q<6;q++)A[r][q]+=f[r]*f[q];A[r][6]+=f[r]*val}
+    }
+    for(let r=0;r<6;r++)A[r][r]+=1e-3;
+    for(let i=0;i<6;i++){let p=i;for(let r=i+1;r<6;r++)if(Math.abs(A[r][i])>Math.abs(A[p][i]))p=r;[A[i],A[p]]=[A[p],A[i]];
+      for(let r=0;r<6;r++){if(r===i)continue;const k=A[r][i]/A[i][i];for(let q=i;q<7;q++)A[r][q]-=k*A[i][q]}}
+    return A.map((row,i)=>row[6]/row[i]);
+  });
+  const bgAt=(x,y,c)=>{const f=feat(x,y);let v=0;for(let i=0;i<6;i++)v+=coef[c][i]*f[i];return v};
+  for(let y=0;y<H;y++)for(let x=0;x<W;x++){const i=y*W+x;if(!ins(x,y)||x<x0||x>x1||y<y0||y>y1)continue;const k=i*4;
+    const e=Math.hypot(d[k]-bgAt(x,y,0),d[k+1]-bgAt(x,y,1),d[k+2]-bgAt(x,y,2));dist[i]=e;if(e>mx)mx=e}
+  // otsu
+  const hist=new Float32Array(64);for(let i=0;i<W*H;i++)if(ins(i%W,(i/W)|0))hist[Math.min(63,(dist[i]/mx*63)|0)]++;
+  let tot=0;for(const v of hist)tot+=v;let sum=0;for(let i=0;i<64;i++)sum+=i*hist[i];
+  let wB=0,sB=0,best=0,bt=8;
+  for(let i=0;i<64;i++){wB+=hist[i];if(!wB)continue;const wF=tot-wB;if(!wF)break;sB+=i*hist[i];const mB=sB/wB,mF=(sum-sB)/wF;const v=wB*wF*(mB-mF)**2;if(v>best){best=v;bt=i}}
+  const otsu=bt/63*mx;
+  const t=Math.max(12,otsu*(0.1+thrPct/90));
+  let m=new Uint8Array(W*H);
+  for(let i=0;i<W*H;i++)m[i]=(ins(i%W,(i/W)|0)&&dist[i]>t)?1:0;
+  const morph=(src,grow)=>{const o=new Uint8Array(W*H);for(let y=0;y<H;y++)for(let x=0;x<W;x++){let hit=grow?0:1;for(let dy=-2;dy<=2;dy++)for(let dx=-2;dx<=2;dx++){if(dx*dx+dy*dy>5)continue;const xx=x+dx,yy=y+dy;const v=(xx<0||yy<0||xx>=W||yy>=H)?0:src[yy*W+xx];if(grow){if(v)hit=1}else if(!v)hit=0}o[y*W+x]=hit}return o};
+  m=morph(morph(m,1),0);
+  // largest component
+  const lab=new Int32Array(W*H);let bestL=0,bestN=0,L=0;const st=[];const sizes=[0];
+  for(let i=0;i<W*H;i++){if(!m[i]||lab[i])continue;L++;let n=0;st.push(i);lab[i]=L;
+    while(st.length){const p=st.pop();n++;const px=p%W,py=(p/W)|0;
+      for(const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]]){const nx=px+dx,ny=py+dy;if(nx<0||ny<0||nx>=W||ny>=H)continue;const q=ny*W+nx;if(m[q]&&!lab[q]){lab[q]=L;st.push(q)}}}
+    sizes.push(n);if(n>bestN){bestN=n;bestL=L}}
+  for(let i=0;i<W*H;i++)m[i]=(lab[i]&&sizes[lab[i]]>=bestN*0.06)?1:0;
+  // fill holes: flood background from border
+  const bgf=new Uint8Array(W*H);const q=[];
+  for(let x=0;x<W;x++){q.push(x);q.push((H-1)*W+x)}for(let y=0;y<H;y++){q.push(y*W);q.push(y*W+W-1)}
+  while(q.length){const p=q.pop();if(bgf[p]||m[p])continue;bgf[p]=1;const px=p%W,py=(p/W)|0;
+    if(px>0)q.push(p-1);if(px<W-1)q.push(p+1);if(py>0)q.push(p-W);if(py<H-1)q.push(p+W)}
+  for(let i=0;i<W*H;i++)if(!bgf[i])m[i]=1;
+  return m;
+}
+function distTransform(m,W,H){ // chamfer distance to outside
+  const D=new Float32Array(W*H);const INF=1e9;
+  for(let i=0;i<W*H;i++)D[i]=m[i]?INF:0;
+  for(let y=0;y<H;y++)for(let x=0;x<W;x++){const i=y*W+x;if(!D[i])continue;let v=D[i];
+    v=Math.min(v,(x?D[i-1]:0)+1,(y?D[i-W]:0)+1,(x&&y?D[i-W-1]:0)+1.414,(x<W-1&&y?D[i-W+1]:0)+1.414);D[i]=v}
+  for(let y=H-1;y>=0;y--)for(let x=W-1;x>=0;x--){const i=y*W+x;if(!D[i])continue;let v=D[i];
+    v=Math.min(v,(x<W-1?D[i+1]:0)+1,(y<H-1?D[i+W]:0)+1,(x<W-1&&y<H-1?D[i+W+1]:0)+1.414,(x&&y<H-1?D[i+W-1]:0)+1.414);D[i]=v}
+  return D;
+}
+function bbox(m,W,H){let x0=W,y0=H,x1=0,y1=0;for(let y=0;y<H;y++)for(let x=0;x<W;x++)if(m[y*W+x]){if(x<x0)x0=x;if(x>x1)x1=x;if(y<y0)y0=y;if(y>y1)y1=y}return {x0,y0,x1,y1}}
+
+// ---------- single photo: estimated ----------
+let aiPipe=null;
+async function aiDepth(img){
+  if(!aiPipe){
+    status('Loading AI depth model (first time only, ~25 MB)...');
+    const T=await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.2');
+    aiPipe=await T.pipeline('depth-estimation','onnx-community/depth-anything-v2-small',{dtype:'q8'});
+  }
+  status('Estimating depth...');
+  const out=await aiPipe(img.src);
+  return out.depth; // RawImage grayscale, near = bright
+}
+async function buildSingle(img){
+  const N=+$('res').value,W=N,H=N;
+  const g=toGrid(img,W,H);const m=makeMask(g,+$('thr').value);
+  const bb=bbox(m,W,H);if(bb.x1<=bb.x0)throw new Error('No object found. Try the Cutout slider.');
+  const D=distTransform(m,W,H);let dmax=1;for(const v of D)if(v>dmax)dmax=v;
+  let aiH=null;
+  if($('ai').checked){
+    try{
+      const dimg=await aiDepth(img);
+      const c=document.createElement('canvas');c.width=W;c.height=H;const x=c.getContext('2d',{willReadFrequently:true});
+      // draw depth in same fit as the photo
+      const dc=document.createElement('canvas');dc.width=dimg.width;dc.height=dimg.height;
+      const id=dc.getContext('2d').createImageData(dimg.width,dimg.height);
+      for(let i=0;i<dimg.width*dimg.height;i++){const v=dimg.data[i*dimg.channels];id.data[i*4]=id.data[i*4+1]=id.data[i*4+2]=v;id.data[i*4+3]=255}
+      dc.getContext('2d').putImageData(id,0,0);
+      x.fillStyle='#000';x.fillRect(0,0,W,H);x.drawImage(dc,g.ox,g.oy,g.w,g.h);
+      const dd=x.getImageData(0,0,W,H).data;aiH=new Float32Array(W*H);
+      let lo=255,hi=0;for(let i=0;i<W*H;i++)if(m[i]){const v=dd[i*4];if(v<lo)lo=v;if(v>hi)hi=v}
+      for(let i=0;i<W*H;i++)aiH[i]=m[i]?(dd[i*4]-lo)/Math.max(1,hi-lo):0;
+    }catch(e){console.warn(e);status('AI depth unavailable here ('+(e.message||e)+'). Using outline inflation instead.');aiH=null;await new Promise(r=>setTimeout(r,1200))}
+  }
+  const span=Math.max(bb.x1-bb.x0,bb.y1-bb.y0)+1;spanOf=span;
+  const thick=span*($('depth').value/100)*0.5;
+  const hf=new Float32Array(W*H); // half thickness at each cell (front height)
+  for(let i=0;i<W*H;i++){
+    if(!m[i])continue;
+    const infl=Math.sqrt(Math.min(1,D[i]/Math.min(dmax,span*0.35)));       // round profile from outline
+    let h=infl;
+    if(aiH)h=0.35*infl+0.65*(0.15+0.85*aiH[i])*Math.min(1,0.25+D[i]/3); // AI relief, tapered at rim
+    hf[i]=Math.max(0.5,h*thick);
+  }
+  // back: mirrored front, flattened a bit because it is a guess
+  const pts=[];const cx=(bb.x0+bb.x1)/2,cy=(bb.y0+bb.y1)/2,sc=2/span;
+  const hAt=(x,y)=>(x<0||y<0||x>=W||y>=H)?0:hf[y*W+x];
+  for(let y=0;y<H;y++)for(let x=0;x<W;x++){
+    const i=y*W+x;if(!m[i])continue;
+    const k=i*4;const r=g.d[k],gg=g.d[k+1],b=g.d[k+2];
+    const gx=(hAt(x+1,y)-hAt(x-1,y))/2,gy=(hAt(x,y+1)-hAt(x,y-1))/2;
+    for(const side of [1,-1]){
+      const zz=side*hf[i]*(side>0?1:0.9);
+      let nx=-gx*side,ny=-gy*side,nz=1*side;
+      const nl=Math.hypot(nx,ny,nz);
+      pts.push((x-cx)*sc,-(y-cy)*sc,zz*sc,nx/nl,-ny/nl,nz/nl,(0.3*r+0.59*gg+0.11*b)/255,r/255,gg/255,b/255);
+    }
+    // fill sides densely where thickness is steep
+    const steps=Math.min(4,Math.ceil(hf[i]/1.5));
+    if(!m[i-1]||!m[i+1]||!m[i-W]||!m[i+W]){
+      let ex=0,ey=0;if(!m[i-1])ex--;if(!m[i+1])ex++;if(!m[i-W])ey--;if(!m[i+W])ey++;
+      const el=Math.hypot(ex,ey)||1;
+      for(let s=1;s<steps*2;s++){const zz=(-1+s/steps)*hf[i];pts.push((x-cx)*sc,-(y-cy)*sc,zz*sc,ex/el,-ey/el,0,(0.3*r+0.59*gg+0.11*b)/255*0.8,r/255,gg/255,b/255)}
+    }
+  }
+  return pts;
+}
+
+// ---------- several photos: visual hull ----------
+async function buildMulti(imgs){
+  const N=Math.min(+$('res').value,80);const G=N;const V=imgs.length;
+  const S=Math.max(96,N*2);
+  const masks=[],grids=[];
+  let ext=0;
+  for(let v=0;v<V;v++){
+    status(`Cutting out photo ${v+1}/${V}...`);await new Promise(r=>setTimeout(r));
+    const g=toGrid(imgs[v],S,S);const m=makeMask(g,+$('thr').value);const bb=bbox(m,S,S);
+    masks.push({m,bb});grids.push(g);
+    ext=Math.max(ext,bb.y1-bb.y0,bb.x1-bb.x0);
+  }
+  // common vertical frame: use mean of bbox centers vertically and horizontally
+  const cy=masks.reduce((a,o)=>a+(o.bb.y0+o.bb.y1)/2,0)/V;
+  const cxs=masks.map(o=>(o.bb.x0+o.bb.x1)/2);
+  const hh=Math.max(...masks.map(o=>Math.max(cy-o.bb.y0,o.bb.y1-cy)))+2;
+  const hw=Math.max(...masks.map((o,i)=>Math.max(cxs[i]-o.bb.x0,o.bb.x1-cxs[i])))+2;
+  const R=Math.max(hh,hw);
+  status('Carving 3D shape from silhouettes...');await new Promise(r=>setTimeout(r));
+  const occ=new Uint8Array(G*G*G);
+  const idx=(x,y,z)=>(x*G+y)*G+z;
+  const cosS=[],sinS=[];for(let v=0;v<V;v++){const a=v/V*Math.PI*2;cosS.push(Math.cos(a));sinS.push(Math.sin(a))}
+  for(let ix=0;ix<G;ix++)for(let iy=0;iy<G;iy++)for(let iz=0;iz<G;iz++){
+    const X=(ix+.5)/G*2-1,Y=1-(iy+.5)/G*2,Z=(iz+.5)/G*2-1;
+    let keep=1;
+    for(let v=0;v<V&&keep;v++){
+      const u=X*cosS[v]+Z*sinS[v];   // horizontal coord in view v (camera looks along -dir)
+      const px=Math.round(cxs[v]+u*R),py=Math.round(cy-Y*R);
+      if(px<0||py<0||px>=S||py>=S||!masks[v].m[py*S+px])keep=0;
+    }
+    occ[idx(ix,iy,iz)]=keep;
+  }
+  const pts=[];const o=(x,y,z)=>(x<0||y<0||z<0||x>=G||y>=G||z>=G)?0:occ[idx(x,y,z)];
+  for(let ix=0;ix<G;ix++)for(let iy=0;iy<G;iy++)for(let iz=0;iz<G;iz++){
+    if(!o(ix,iy,iz))continue;
+    if(o(ix-1,iy,iz)&&o(ix+1,iy,iz)&&o(ix,iy-1,iz)&&o(ix,iy+1,iz)&&o(ix,iy,iz-1)&&o(ix,iy,iz+1))continue;
+    // gradient of smoothed occupancy
+    let nx=0,ny=0,nz=0;
+    for(let a=-3;a<=3;a++)for(let b=-3;b<=3;b++)for(let c=-3;c<=3;c++){
+      if(!o(ix+a,iy+b,iz+c))continue;const wgt=Math.exp(-(a*a+b*b+c*c)/6);nx-=a*wgt;ny-=b*wgt;nz-=c*wgt}
+    const nl=Math.hypot(nx,ny,nz)||1;nx/=nl;ny/=nl;nz/=nl;
+    const X=(ix+.5)/G*2-1,Y=1-(iy+.5)/G*2,Z=(iz+.5)/G*2-1;
+    // color: best-facing view
+    let bv=0,bd=-9;for(let v=0;v<V;v++){const d=nx*cosS[v]*0+0;const dir=nx*sinS[v]*0;const dd=(nx*(-sinS[v])*0)+(nx*cosS[v]+nz*sinS[v]);if(dd>bd){bd=dd;bv=v}}
+    // view direction in world: camera sees +u axis => image u coordinate; depth axis w=-X*sin+Z*cos faces camera at +w
+    let best=0,bw=-9;for(let v=0;v<V;v++){const w=-nx*sinS[v]+nz*cosS[v];if(w>bw){bw=w;best=v}}
+    const u=X*cosS[best]+Z*sinS[best];
+    const g=grids[best];const px=Math.max(0,Math.min(S-1,Math.round(cxs[best]+u*R))),py=Math.max(0,Math.min(S-1,Math.round(cy-Y*R)));
+    const k=(py*S+px)*4;const r=g.d[k],gg=g.d[k+1],b=g.d[k+2];
+    pts.push(X,Y,Z,nx,ny,nz,(0.3*r+0.59*gg+0.11*b)/255,r/255,gg/255,b/255);
+  }
+  return pts;
+}
+
+// ---------- demo ----------
+function demoPts(){
+  const pts=[];const G=60;
+  const f=(x,y,z)=>{ // torus knot-ish: torus + sphere
+    const q=Math.hypot(x,z)-0.55;const t=Math.hypot(q,y)-0.22;
+    const s=Math.hypot(x+0.0,y-0.0,z)-0.0;return t};
+  for(let i=0;i<G;i++)for(let j=0;j<G;j++)for(let k=0;k<G;k++){
+    const x=(i+.5)/G*2-1,y=(j+.5)/G*2-1,z=(k+.5)/G*2-1;const d=f(x,y,z);
+    if(d>0||d<-0.07)continue;const e=0.01;
+    let nx=f(x+e,y,z)-f(x-e,y,z),ny=f(x,y+e,z)-f(x,y-e,z),nz=f(x,y,z+e)-f(x,y,z-e);const l=Math.hypot(nx,ny,nz)||1;
+    pts.push(x,y,z,nx/l,ny/l,nz/l,0.6+0.4*Math.sin(Math.atan2(z,x)*3),0.9,0.7,0.4);
+  }
+  return pts;
+}
+
+// ---------- ASCII renderer ----------
+let lastFrame='';
+function render(){
+  const dpr=Math.min(2,devicePixelRatio||1);
+  const w=cv.clientWidth,h=cv.clientHeight;
+  if(cv.width!==w*dpr||cv.height!==h*dpr){cv.width=w*dpr;cv.height=h*dpr}
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.fillStyle='#0b0d10';ctx.fillRect(0,0,w,h);
+  if(!model)return;
+  const cs=Math.max(8,Math.min(14,Math.floor(Math.min(w,h)/60))); // cell size px (height)
+  const cw=cs*0.6,ch=cs;
+  const cols=Math.floor(w/cw),rows=Math.floor(h/ch);
+  const zb=new Float32Array(cols*rows).fill(-1e9);const lum=new Float32Array(cols*rows);const cr=new Float32Array(cols*rows*3);
+  const ca=Math.cos(rotY),sa=Math.sin(rotY),cb=Math.cos(rotX),sb=Math.sin(rotX);
+  const scale=Math.min(cols*cw,rows*ch)*0.42*zoom;
+  const P=model.pts,n=P.length/10;const sp=(model.spacing||0.03)*scale;const rx=Math.max(1,Math.round(sp/cw*1.3)),ry=Math.max(1,Math.round(sp/ch*1.3));
+  const Lx=-0.4,Ly=0.6,Lz=0.7,ll=Math.hypot(Lx,Ly,Lz);
+  for(let i=0;i<n;i++){
+    const o=i*10;
+    let x=P[o],y=P[o+1],z=P[o+2],nx=P[o+3],ny=P[o+4],nz=P[o+5];
+    // rotate Y then X
+    let x1=x*ca+z*sa,z1=-x*sa+z*ca;let y1=y*cb-z1*sb,z2=y*sb+z1*cb;
+    let nx1=nx*ca+nz*sa,nz1=-nx*sa+nz*ca;let ny1=ny*cb-nz1*sb,nz2=ny*sb+nz1*cb;
+    if(nz2<-0.15)continue; // backface
+    let d=(nx1*Lx+ny1*Ly+nz2*Lz)/ll;d=Math.max(0,d)*0.8+0.2*Math.max(0,nz2);
+    const lv=color?Math.min(1,d*0.5+P[o+6]*0.5+0.1):d;
+    const fx=(w/2+x1*scale)/cw,fy=(h/2-y1*scale)/ch;
+    const bx=Math.floor(fx-rx/2),by=Math.floor(fy-ry/2);
+    for(let dy=0;dy<ry;dy++)for(let dx=0;dx<rx;dx++){
+      const sx=bx+dx,sy=by+dy;if(sx<0||sy<0||sx>=cols||sy>=rows)continue;
+      const j=sy*cols+sx;if(z2<=zb[j])continue;zb[j]=z2;lum[j]=lv;
+      cr[j*3]=P[o+7];cr[j*3+1]=P[o+8];cr[j*3+2]=P[o+9];}
+  }
+  ctx.font=`${cs}px ui-monospace,Menlo,Consolas,monospace`;ctx.textBaseline='top';
+  const lines=[];
+  for(let r=0;r<rows;r++){let line='';
+    for(let c=0;c<cols;c++){const j=r*cols+c;
+      if(zb[j]<-1e8){line+=' ';continue}
+      let l=Math.max(0,Math.min(1,lum[j]));if(invert)l=1-l;
+      const ch2=RAMP[Math.max(1,Math.min(RAMP.length-1,Math.floor(l*(RAMP.length-1))))];
+      line+=ch2;
+      if(color){const k=Math.max(.35,l);ctx.fillStyle=`rgb(${(cr[j*3]*255*k*1.2)|0},${(cr[j*3+1]*255*k*1.2)|0},${(cr[j*3+2]*255*k*1.2)|0})`}
+      else ctx.fillStyle=`rgb(${(80+l*175)|0},${(200+l*55)|0},${(120+l*100)|0})`;
+      ctx.fillText(ch2,c*cw,r*ch);
+    }lines.push(line)}
+  lastFrame=lines.join('\n');
+}
+function tick(t){
+  const dt=Math.min(50,t-lastT)/1000;lastT=t;
+  if(spin&&!dragging)rotY+=dt*0.6;
+  render();requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+
+// interaction
+const ptrs=new Map();let pinch=0;
+cv.onpointerdown=e=>{cv.setPointerCapture(e.pointerId);ptrs.set(e.pointerId,[e.clientX,e.clientY]);dragging=true;cv.style.cursor='grabbing'};
+cv.onpointermove=e=>{
+  if(!ptrs.has(e.pointerId))return;
+  const p=ptrs.get(e.pointerId);
+  if(ptrs.size===1){rotY+=(e.clientX-p[0])*0.01;rotX=Math.max(-1.5,Math.min(1.5,rotX+(e.clientY-p[1])*0.01))}
+  ptrs.set(e.pointerId,[e.clientX,e.clientY]);
+  if(ptrs.size===2){const [a,b]=[...ptrs.values()];const d=Math.hypot(a[0]-b[0],a[1]-b[1]);if(pinch)zoom=Math.max(.3,Math.min(4,zoom*d/pinch));pinch=d}
+};
+const up=e=>{ptrs.delete(e.pointerId);pinch=0;if(!ptrs.size){dragging=false;cv.style.cursor='grab'}};
+cv.onpointerup=up;cv.onpointercancel=up;
+cv.onwheel=e=>{e.preventDefault();zoom=Math.max(.3,Math.min(4,zoom*(e.deltaY<0?1.08:.92)))};
+addEventListener('keydown',e=>{const s=.1;if(e.key==='ArrowLeft')rotY-=s;if(e.key==='ArrowRight')rotY+=s;if(e.key==='ArrowUp')rotX-=s;if(e.key==='ArrowDown')rotX+=s});
+$('spin').onclick=()=>{spin=!spin;$('spin').textContent='Auto-rotate: '+(spin?'on':'off')};
+$('col').onclick=()=>{color=!color;$('col').textContent='Color: '+(color?'on':'off')};
+$('inv').onclick=()=>{invert=!invert};
+$('copy').onclick=async()=>{try{await navigator.clipboard.writeText(lastFrame);status('Frame copied.')}catch(_){status('Copy blocked by the browser.')}};
+$('demo').onclick=()=>{setModel(demoPts());status('Demo shape (a torus). Upload a photo to make your own.')};
+function setModel(p,sp){model={pts:new Float32Array(p),spacing:sp||0.03};$('copy').disabled=false}
+$('build').onclick=async()=>{
+  $('build').disabled=true;
+  try{
+    let mode=$('mode').value;if(mode==='auto')mode=images.length>2?'multi':'single';
+    if(mode==='multi'&&images.length<3)throw new Error('Reconstruction needs at least 3 photos around the object (8+ is much better).');
+    status('Working...');await new Promise(r=>setTimeout(r));
+    const p=mode==='multi'?await buildMulti(images):await buildSingle(images[0]);
+    if(p.length<30)throw new Error('Nothing to show. Try the Cutout slider or a plainer background.');
+    setModel(p,mode==='multi'?2/Math.min(+$('res').value,80):2/Math.max(1,spanOf));
+    status(mode==='multi'?`Reconstructed from ${images.length} silhouettes (${p.length/10} surface points). Drag to rotate.`:
+      `Estimated from 1 photo (${p.length/10} points). Back and sides are a guess. Drag to rotate.`);
+  }catch(e){status('Problem: '+(e.message||e))}
+  $('build').disabled=false;
+};
+setModel(demoPts());
+// test hook
+window.__asciiTest={buildSingle,buildMulti,setModel,getImages:()=>images,setImages:a=>{images=a},frame:()=>lastFrame};
+</script></body></html>

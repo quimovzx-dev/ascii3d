@@ -45,8 +45,10 @@ input[type=range]{flex:1;min-width:80px}
 <button class="primary" id="build" disabled>Build ASCII model</button>
 <div id="status">Pick a photo to start. A plain background works best.</div>
 <div class="row"><button id="spin">Auto-rotate: on</button><button id="col">Color: off</button><button id="inv">Invert shade</button></div>
+<div class="row"><button data-v="0,0">Front</button><button data-v="1.5708,0">Side</button><button data-v="3.1416,0">Back</button><button data-v="0,-1.45">Top</button></div>
+<div class="row"><button id="png" disabled>Save PNG</button><button id="txt" disabled>Save .txt</button></div>
 <div class="row"><button id="copy" disabled>Copy frame</button><button id="demo">Try demo shape</button></div>
-<div class="note"><b>Honest limits.</b> With <b>one photo</b> the back and sides are guessed (the shape is inflated from the outline and, optionally, AI depth, then mirrored). With <b>several photos</b> taken evenly around the object (turntable style, first photo = front, going around in one direction, same distance and height) it carves a real shape from the silhouettes. Hollows and concave parts cannot be recovered from silhouettes.</div>
+<div class="note"><b>Honest limits.</b> v2 adds view buttons, axis gizmo, colour and PNG/.txt export for readability; shape accuracy is unchanged. With <b>one photo</b> the back and sides are guessed (the shape is inflated from the outline and, optionally, AI depth, then mirrored). With <b>several photos</b> taken evenly around the object (turntable style, first photo = front, going around in one direction, same distance and height) it carves a real shape from the silhouettes. Hollows and concave parts cannot be recovered from silhouettes.</div>
 </aside>
 <div id="stage"><canvas id="view"></canvas><div id="hint">drag to rotate - scroll or pinch to zoom</div></div>
 </main>
@@ -109,7 +111,12 @@ function makeMask(g,thrPct){
   });
   const bgAt=(x,y,c)=>{const f=feat(x,y);let v=0;for(let i=0;i<6;i++)v+=coef[c][i]*f[i];return v};
   for(let y=0;y<H;y++)for(let x=0;x<W;x++){const i=y*W+x;if(!ins(x,y)||x<x0||x>x1||y<y0||y>y1)continue;const k=i*4;
-    const e=Math.hypot(d[k]-bgAt(x,y,0),d[k+1]-bgAt(x,y,1),d[k+2]-bgAt(x,y,2));dist[i]=e;if(e>mx)mx=e}
+    const br0=bgAt(x,y,0),bg0=bgAt(x,y,1),bb0=bgAt(x,y,2);
+    const L=0.3*d[k]+0.59*d[k+1]+0.11*d[k+2],BL=Math.max(1,0.3*br0+0.59*bg0+0.11*bb0);
+    // chroma difference with luminance divided out, so soft shadows (same hue, darker) do not count as object
+    const cr=Math.hypot((d[k]/Math.max(1,L)-br0/BL),(d[k+1]/Math.max(1,L)-bg0/BL),(d[k+2]/Math.max(1,L)-bb0/BL))*60;
+    const up=Math.max(0,L-BL),dn=Math.max(0,BL-L);
+    const e=Math.hypot(up,cr,dn*Math.min(1,0.2+cr/25));dist[i]=e;if(e>mx)mx=e}
   // otsu
   const hist=new Float32Array(64);for(let i=0;i<W*H;i++)if(ins(i%W,(i/W)|0))hist[Math.min(63,(dist[i]/mx*63)|0)]++;
   let tot=0;for(const v of hist)tot+=v;let sum=0;for(let i=0;i<64;i++)sum+=i*hist[i];
@@ -329,6 +336,12 @@ function render(){
       ctx.fillText(ch2,c*cw,r*ch);
     }lines.push(line)}
   lastFrame=lines.join('\n');
+  // axis gizmo
+  const gx=44,gy=h-44,L=26;
+  [['X',1,0,0,'#ff6b6b'],['Y',0,1,0,'#6bff8a'],['Z',0,0,1,'#6bb6ff']].forEach(a=>{
+    const x1=a[1]*ca+a[3]*sa,z1=-a[1]*sa+a[3]*ca,y1=a[2]*cb-z1*sb;
+    ctx.strokeStyle=a[4];ctx.fillStyle=a[4];ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(gx,gy);ctx.lineTo(gx+x1*L,gy-y1*L);ctx.stroke();
+    ctx.font='11px monospace';ctx.fillText(a[0],gx+x1*(L+8)-3,gy-y1*(L+8)-5)});
 }
 function tick(t){
   const dt=Math.min(50,t-lastT)/1000;lastT=t;
@@ -356,7 +369,11 @@ $('col').onclick=()=>{color=!color;$('col').textContent='Color: '+(color?'on':'o
 $('inv').onclick=()=>{invert=!invert};
 $('copy').onclick=async()=>{try{await navigator.clipboard.writeText(lastFrame);status('Frame copied.')}catch(_){status('Copy blocked by the browser.')}};
 $('demo').onclick=()=>{setModel(demoPts());status('Demo shape (a torus). Upload a photo to make your own.')};
-function setModel(p,sp){model={pts:new Float32Array(p),spacing:sp||0.03};$('copy').disabled=false}
+document.querySelectorAll('[data-v]').forEach(b=>b.onclick=()=>{const v=b.dataset.v.split(',');spin=false;$('spin').textContent='Auto-rotate: off';rotY=+v[0];rotX=+v[1]});
+function dl(u,n){const a=document.createElement('a');a.href=u;a.download=n;a.click()}
+$('png').onclick=()=>{render();dl(cv.toDataURL('image/png'),'ascii3d.png')};
+$('txt').onclick=()=>{dl(URL.createObjectURL(new Blob([lastFrame],{type:'text/plain'})),'ascii3d.txt')};
+function setModel(p,sp){$('png').disabled=false;$('txt').disabled=false;model={pts:new Float32Array(p),spacing:sp||0.03};$('copy').disabled=false}
 $('build').onclick=async()=>{
   $('build').disabled=true;
   try{
@@ -365,6 +382,7 @@ $('build').onclick=async()=>{
     status('Working...');await new Promise(r=>setTimeout(r));
     const p=mode==='multi'?await buildMulti(images):await buildSingle(images[0]);
     if(p.length<30)throw new Error('Nothing to show. Try the Cutout slider or a plainer background.');
+    if(mode!=='multi'&&!color){color=true;$('col').textContent='Color: on'}
     setModel(p,mode==='multi'?2/Math.min(+$('res').value,80):2/Math.max(1,spanOf));
     status(mode==='multi'?`Reconstructed from ${images.length} silhouettes (${p.length/10} surface points). Drag to rotate.`:
       `Estimated from 1 photo (${p.length/10} points). Back and sides are a guess. Drag to rotate.`);
